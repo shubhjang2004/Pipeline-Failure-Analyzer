@@ -1,1 +1,7 @@
-git add .
+venv/
+chroma_db/
+.env
+__pycache__/
+*.pyc
+*.egg-info/
+.DS_Store

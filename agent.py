@@ -1,6 +1,7 @@
 import re
 import json
 import os
+import time
 from typing import TypedDict
 from datetime import datetime, timezone
 
@@ -13,13 +14,9 @@ from models import PipelineFailure, AnalysisResult, SimilarFailure
 
 
 
-from langchain_groq import ChatGroq
 
-llm = ChatGroq(
-    model="llama-3.3-70b-versatile",  # free, very capable
-    temperature=0,
-    api_key=os.getenv("GROQ_API_KEY")
-)
+import anthropic
+claude = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
 
 
@@ -88,67 +85,63 @@ def search_rag_node(state: AnalysisState) -> AnalysisState:
 
 
 def generate_analysis_node(state: AnalysisState) -> AnalysisState:
-
-    if state["similar_failures"]:
-        past_context = "Past failures from knowledge base (use these to inform your fix):\n"
-        for f in state["similar_failures"]:
-            past_context += (
-                f"  [{f['similarity_pct']}% match] {f['category']} in {f['pipeline']}\n"
-                f"  Fix used: {f['fix']}\n\n"
-            )
-    else:
-        past_context = "No similar past failures found in knowledge base."
-
-    prompt = f"""You are a senior DevOps/SRE engineer. Analyze this CI/CD failure.
-
-Pipeline: {state["pipeline_name"]}
-Stage: {state["stage"]}
-Branch: {state["branch"]}
-Commit: {state["commit_sha"]}
-
-Key error lines (extracted from raw logs):
-{state["extracted_errors"]}
-
-{past_context}
-
-Instructions:
-- Be specific. "Update the package version" is bad.
-  "Pin numpy to >=1.26.0 in requirements.txt" is good.
-- If a past failure has a high similarity match, reuse its fix unless the errors differ.
-- error_category must be one of:
-  Dependency Error | Docker Build Error | Test Failure | Deployment Error |
-  Auth Error | Network Error | Resource Error | Config Error | Other
-
-Return ONLY valid JSON. No markdown. No explanation outside the JSON.
-
-{{
-    "error_category": "...",
-    "root_cause": "2-3 sentences max",
-    "fix_suggestion": "Numbered steps with actual commands or file paths",
-    "confidence": "high | medium | low"
-}}"""
-
-    response = llm.invoke([HumanMessage(content=prompt)])
-    text = response.content.strip()
-
-    
-    if "```" in text:
-        # Extract content between first ``` and last ```
-        parts = text.split("```")
-        text = parts[1].lstrip("json").strip() if len(parts) >= 2 else text
-
-    try:
-        analysis = json.loads(text)
-    except json.JSONDecodeError:
-        # Graceful fallback — never crash on bad LLM output
-        analysis = {
-            "error_category": "Other",
-            "root_cause": text[:400],
-            "fix_suggestion": "Manual investigation required. LLM response was not valid JSON.",
-            "confidence": "low"
+    tools = [{
+        "name": "report_analysis",
+        "description": "Report the structured pipeline failure analysis",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "error_category": {
+                    "type": "string",
+                    "enum": ["Dependency Error", "Docker Build Error", "Test Failure",
+                             "Deployment Error", "Auth Error", "Network Error",
+                             "Resource Error", "Config Error", "Other"]
+                },
+                "root_cause": {"type": "string"},
+                "fix_suggestion": {"type": "string"},
+                "confidence": {"type": "string", "enum": ["high", "medium", "low"]}
+            },
+            "required": ["error_category", "root_cause", "fix_suggestion", "confidence"]
         }
+    }]
 
-    return {**state, "final_analysis": analysis}
+    past_context = ""
+    if state["similar_failures"]:
+        past_context = "Past similar failures:\n"
+        for f in state["similar_failures"]:
+            past_context += f"[{f['similarity_pct']}% match] Fix used: {f['fix']}\n"
+
+    for attempt in range(3):  # retry up to 3 times
+        try:
+            response = claude.messages.create(
+                model="claude-sonnet-4-5",
+                max_tokens=1000,
+                tools=tools,
+                tool_choice={"type": "tool", "name": "report_analysis"},
+                messages=[{
+                    "role": "user",
+                    "content": f"""Analyze this CI/CD failure.
+Pipeline: {state['pipeline_name']} | Stage: {state['stage']}
+Errors: {state['extracted_errors']}
+{past_context}
+Give specific fix steps with actual commands or file paths."""
+                }]
+            )
+
+            analysis = response.content[0].input  # guaranteed structured, no JSON parsing
+            return {**state, "final_analysis": analysis}
+
+        except anthropic.RateLimitError:
+            time.sleep(2 ** attempt)  # 1s, 2s, 4s backoff
+
+        except Exception as e:
+            if attempt == 2:  # only give up after 3rd failure
+                return {**state, "final_analysis": {
+                    "error_category": "Other",
+                    "root_cause": f"Analysis failed: {str(e)}",
+                    "fix_suggestion": "Manual investigation required.",
+                    "confidence": "low"
+                }}
 
 
 

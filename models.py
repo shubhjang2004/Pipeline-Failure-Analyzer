@@ -1,40 +1,34 @@
-"""
-models.py — Pydantic data shapes used across the whole app.
 
-Pydantic does two things here:
-1. Validates incoming API request bodies automatically
-2. Serializes outgoing responses to JSON
-
-If someone sends pipeline_name=123 (int), Pydantic coerces it to "123".
-If stage is missing entirely, FastAPI returns a 422 error before your code runs.
-"""
 from pydantic import BaseModel
 from typing import Optional
-
+from datetime import datetime
+import uuid
 
 class PipelineFailure(BaseModel):
-    """What the caller sends to /analyze"""
     pipeline_name: str
-    stage: str          # "build" | "test" | "deploy" — we don't enforce, just informational
-    logs: str           # raw stdout/stderr from the failed run
+    stage: str
+    logs: str
     branch: Optional[str] = None
     commit_sha: Optional[str] = None
 
-
 class SimilarFailure(BaseModel):
-    """One entry from the RAG knowledge base returned in the result"""
     pipeline: str
     category: str
     fix: str
-    similarity_pct: float   # 0–100, how close the past failure is to this one
-
+    similarity_pct: float
 
 class AnalysisResult(BaseModel):
-    """What /analyze returns"""
+    id: str = str(uuid.uuid4())       # ADD - needed for feedback loop
     pipeline_name: str
-    error_category: str     # e.g. "Dependency Error", "OOMKilled", "Auth Error"
-    root_cause: str         # 2-3 sentence explanation
+    error_category: str
+    root_cause: str
     similar_past_failures: list[SimilarFailure]
-    fix_suggestion: str     # Concrete steps, ideally with commands
-    confidence: str         # "high" | "medium" | "low"
-    analyzed_at: str        # ISO 8601 timestamp
+    fix_suggestion: str
+    confidence: str
+    analyzed_at: str
+    was_helpful: Optional[bool] = None  # ADD - for feedback loop
+
+class FeedbackRequest(BaseModel):       # ADD - new model entirely
+    analysis_id: str
+    was_helpful: bool
+    actual_fix: Optional[str] = None
